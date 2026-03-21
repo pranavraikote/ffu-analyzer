@@ -2,7 +2,15 @@ node_modules
 .env
 ffu.db
 backend/ffu.db
+backend/ffu.db-journal
 backend/__pycache__/
+backend/.venv/
+backend/data/*
+backend/ffu.index
+backend/chunks.json
+backend/**/__pycache__/
+backend/**/*.pyc
 .DS_Store
 backend/data/
-backend/ffu.db-journal
+dist/
+frontend/dist/

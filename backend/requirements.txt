@@ -3,3 +3,7 @@ uvicorn
 openai
 pymupdf4llm
 python-dotenv
+numpy
+rank-bm25
+openpyxl
+faiss-cpu
