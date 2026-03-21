@@ -1,9 +1,10 @@
 import { useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 
-type Source = { doc: string; section: string }
-type Message = { role: 'user' | 'assistant'; content: string; sources?: Source[] }
+type Source      = { doc: string; section: string; doc_type?: string }
+type Message     = { role: 'user' | 'assistant'; content: string; sources?: Source[] }
 type UploadState = 'idle' | 'uploading' | 'indexing' | 'ready' | 'error'
+type StagedFile  = { file: File; docType: 'base' | 'addendum'; overridden: boolean }
 
 const ui = {
   page:      { margin: 0, minHeight: '100vh', background: '#f0f0f0', color: '#1a1a1a', fontFamily: 'system-ui, sans-serif' },
@@ -16,12 +17,16 @@ const ui = {
   asstBub:   { maxWidth: '82%', padding: '12px 16px', borderRadius: 16, background: '#f5f5f5', fontSize: 14, lineHeight: 1.6, whiteSpace: 'pre-wrap' as const, border: '1px solid #e8e8e8' },
   status:    { fontSize: 12, color: '#888', fontStyle: 'italic', padding: '6px 12px', display: 'flex', alignItems: 'center', gap: 6 },
   sources:   { display: 'flex', flexWrap: 'wrap' as const, gap: 6, paddingLeft: 4, marginTop: 4 },
-  sourceTag: { fontSize: 11, padding: '3px 8px', borderRadius: 12, background: '#eef2ff', color: '#4f46e5', border: '1px solid #c7d2fe', cursor: 'default' as const },
   form:      { display: 'grid', gridTemplateColumns: '1fr auto', gap: 8 },
   input:     { padding: '12px 16px', border: '1px solid #ddd', borderRadius: 8, font: 'inherit', fontSize: 14, outline: 'none' },
   send:      { padding: '12px 20px', border: 'none', borderRadius: 8, background: '#1a1a1a', color: '#fff', font: 'inherit', fontSize: 14, cursor: 'pointer' },
   dot:       { display: 'inline-block', animation: 'pulse 1.2s ease-in-out infinite' },
 }
+
+const sourceTagStyle = (docType?: string): React.CSSProperties =>
+  docType === 'addendum'
+    ? { fontSize: 11, padding: '3px 8px', borderRadius: 12, background: '#fffbeb', color: '#d97706', border: '1px solid #fde68a', cursor: 'default' as const }
+    : { fontSize: 11, padding: '3px 8px', borderRadius: 12, background: '#eef2ff', color: '#4f46e5', border: '1px solid #c7d2fe', cursor: 'default' as const }
 
 const uploadZoneStyle = (dragging: boolean, state: UploadState): React.CSSProperties => ({
   border: `2px dashed ${dragging ? '#1a1a1a' : state === 'ready' ? '#16a34a' : state === 'error' ? '#dc2626' : '#ddd'}`,
@@ -30,7 +35,7 @@ const uploadZoneStyle = (dragging: boolean, state: UploadState): React.CSSProper
   textAlign: 'center',
   cursor: state === 'uploading' || state === 'indexing' ? 'default' : 'pointer',
   background: dragging ? '#f0f0f0' : '#fafafa',
-  transition: 'border-color 0.15s, background 0.15s',
+  transition: 'border-color 0.15s',
   fontSize: 13,
   color: state === 'ready' ? '#16a34a' : state === 'error' ? '#dc2626' : '#666',
 })
@@ -40,6 +45,7 @@ function Spinner() {
 }
 
 function App() {
+  const [staged, setStaged]           = useState<StagedFile[]>([])
   const [uploadState, setUploadState] = useState<UploadState>('idle')
   const [uploadLabel, setUploadLabel] = useState('Drop PDF or Excel files here, or click to browse')
   const [dragging, setDragging]       = useState(false)
@@ -53,29 +59,48 @@ function App() {
     chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: 'smooth' })
   }, 0)
 
-  const handleFiles = async (files: FileList) => {
-    if (!files.length) return
+  const stageFiles = (files: FileList) => {
     const allowed = Array.from(files).filter(f => f.name.endsWith('.pdf') || f.name.endsWith('.xlsx'))
     if (!allowed.length) {
       setUploadState('error')
       setUploadLabel('Only PDF and Excel files are supported')
       return
     }
+    setStaged(allowed.map(f => ({ file: f, docType: 'base' as const, overridden: false })))
+    setUploadState('idle')
+  }
 
-    // Upload
+  const toggleDocType = (i: number) =>
+    setStaged(s => s.map((f, idx) => idx === i
+      ? { ...f, docType: f.docType === 'base' ? 'addendum' : 'base', overridden: true }
+      : f))
+
+  const uploadStaged = async () => {
+    if (!staged.length) return
     setUploadState('uploading')
-    setUploadLabel(`Uploading ${allowed.length} file${allowed.length > 1 ? 's' : ''}…`)
+    setUploadLabel(`Uploading ${staged.length} file${staged.length > 1 ? 's' : ''}…`)
+
     const form = new FormData()
-    allowed.forEach(f => form.append('files', f))
+    staged.forEach(s => form.append('files', s.file))
+    const manualOverrides = Object.fromEntries(staged.filter(s => s.overridden).map(s => [s.file.name, s.docType]))
+    form.append('overrides', JSON.stringify(manualOverrides))
+
+    let docTypes: Record<string, string> = {}
     try {
-      await fetch('/api/upload', { method: 'POST', body: form })
+      const res  = await fetch('/api/upload', { method: 'POST', body: form })
+      const data = await res.json()
+      docTypes   = data.doc_types ?? {}
     } catch {
       setUploadState('error')
       setUploadLabel('Upload failed — check server connection')
       return
     }
 
-    // Auto-process
+    const base      = Object.values(docTypes).filter(t => t === 'base').length
+    const amendment = Object.values(docTypes).filter(t => t === 'addendum').length
+    const summary   = [base && `${base} base`, amendment && `${amendment} amendment`].filter(Boolean).join(', ')
+
+    setStaged([])
     setUploadState('indexing')
     setUploadLabel('Indexing documents…')
     try {
@@ -83,8 +108,8 @@ function App() {
       setUploadState('ready')
       setUploadLabel(
         data.status === 'up_to_date'
-          ? `Ready — documents already indexed`
-          : `Ready — ${data.new} new document${data.new !== 1 ? 's' : ''} indexed`
+          ? 'Ready — documents already indexed'
+          : `Ready — ${summary} indexed`
       )
     } catch {
       setUploadState('error')
@@ -95,7 +120,7 @@ function App() {
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault()
     setDragging(false)
-    handleFiles(e.dataTransfer.files)
+    stageFiles(e.dataTransfer.files)
   }
 
   const send = async (e: React.FormEvent) => {
@@ -114,7 +139,6 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: query, history: history.map(({ role, content }) => ({ role, content })) }),
       })
-
       const reader  = resp.body!.getReader()
       const decoder = new TextDecoder()
       let content   = ''
@@ -135,7 +159,7 @@ function App() {
               content += event.content
               setMessages(m => {
                 const updated = [...m]
-                const last = updated[updated.length - 1]
+                const last    = updated[updated.length - 1]
                 if (last?.role === 'assistant') {
                   updated[updated.length - 1] = { ...last, content, sources }
                 } else {
@@ -160,24 +184,57 @@ function App() {
       <div style={ui.app}>
         <div style={ui.header}>FFU Analyzer</div>
 
-        {/* Upload zone */}
-        <div
-          style={uploadZoneStyle(dragging, uploadState)}
-          onClick={() => uploadState !== 'uploading' && uploadState !== 'indexing' && fileInput.current?.click()}
-          onDragOver={e => { e.preventDefault(); setDragging(true) }}
-          onDragLeave={() => setDragging(false)}
-          onDrop={onDrop}
-        >
-          {(uploadState === 'uploading' || uploadState === 'indexing') && <Spinner />}{' '}
-          {uploadLabel}
-        </div>
+        {/* Upload zone / staging */}
+        {staged.length > 0 ? (
+          <div style={{ border: '1px solid #ddd', borderRadius: 8, background: '#fafafa', padding: 16, display: 'grid', gap: 8 }}>
+            <div style={{ fontSize: 11, color: '#888', marginBottom: 2 }}>
+              Type is auto-detected — toggle if incorrect. <strong>Amendment</strong> = document that modifies or supersedes the original.
+            </div>
+            {staged.map((s, i) => (
+              <div key={i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 13 }}>
+                <span style={{ color: '#1a1a1a', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 500 }}>{s.file.name}</span>
+                <button
+                  onClick={() => toggleDocType(i)}
+                  title="Click to toggle document type"
+                  style={{
+                    padding: '2px 10px', borderRadius: 12, fontSize: 11, cursor: 'pointer', border: 'none',
+                    background: s.docType === 'addendum' ? '#fffbeb' : '#eef2ff',
+                    color:      s.docType === 'addendum' ? '#d97706'  : '#4f46e5',
+                    outline:    `1px solid ${s.docType === 'addendum' ? '#fde68a' : '#c7d2fe'}`,
+                  }}
+                >
+                  {s.docType === 'addendum' ? 'Amendment' : 'Base doc'}
+                </button>
+              </div>
+            ))}
+            <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+              <button onClick={uploadStaged} style={{ padding: '8px 16px', border: 'none', borderRadius: 8, background: '#1a1a1a', color: '#fff', font: 'inherit', fontSize: 13, cursor: 'pointer' }}>
+                Upload & Index
+              </button>
+              <button onClick={() => setStaged([])} style={{ padding: '8px 12px', border: '1px solid #ddd', borderRadius: 8, background: '#fff', font: 'inherit', fontSize: 13, cursor: 'pointer', color: '#666' }}>
+                Clear
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div
+            style={uploadZoneStyle(dragging, uploadState)}
+            onClick={() => uploadState !== 'uploading' && uploadState !== 'indexing' && fileInput.current?.click()}
+            onDragOver={e => { e.preventDefault(); setDragging(true) }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={onDrop}
+          >
+            {(uploadState === 'uploading' || uploadState === 'indexing') && <Spinner />}{' '}
+            {uploadLabel}
+          </div>
+        )}
         <input
           ref={fileInput}
           type="file"
           accept=".pdf,.xlsx"
           multiple
           style={{ display: 'none' }}
-          onChange={e => { if (e.target.files) { handleFiles(e.target.files); e.target.value = '' } }}
+          onChange={e => { if (e.target.files) { stageFiles(e.target.files); e.target.value = '' } }}
         />
 
         {/* Chat */}
@@ -193,7 +250,7 @@ function App() {
                 {msg.sources && msg.sources.length > 0 && (
                   <div style={ui.sources}>
                     {msg.sources.map((s, j) => (
-                      <span key={j} style={ui.sourceTag} title={s.doc}>
+                      <span key={j} style={sourceTagStyle(s.doc_type)} title={s.doc}>
                         {s.section || s.doc.replace('.pdf', '').replace('.xlsx', '')}
                       </span>
                     ))}
@@ -203,14 +260,10 @@ function App() {
             )
           )}
           {streamStatus === 'searching' && (
-            <div style={ui.asstWrap}>
-              <div style={ui.status}><Spinner /> Searching documents…</div>
-            </div>
+            <div style={ui.asstWrap}><div style={ui.status}><Spinner /> Searching documents…</div></div>
           )}
           {streamStatus === 'reading' && (
-            <div style={ui.asstWrap}>
-              <div style={ui.status}><Spinner /> Reading sources…</div>
-            </div>
+            <div style={ui.asstWrap}><div style={ui.status}><Spinner /> Reading sources…</div></div>
           )}
         </div>
 

@@ -6,13 +6,15 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import fitz
 import numpy as np
 import faiss
 import pymupdf4llm
 import openpyxl
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, APIRouter, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from rank_bm25 import BM25Okapi
@@ -36,13 +38,59 @@ HNSW_EF_SEARCH  = 50
 AMA_RE      = re.compile(r'^\*\*([A-Z]{1,4}(?:\.[0-9]{1,4})*)\*\*', re.MULTILINE)
 PAGE_HDR_RE = re.compile(r'DOKUMENT STATUS\s*\n(?:.*?\n){0,20}?(?=\*\*[A-Z]|#{1,6}\s|\Z)', re.DOTALL)
 HEADING_RE  = re.compile(r'^(#{1,6})\s+(.+)$', re.MULTILINE)
+AMA_IN_TEXT = re.compile(r'\b([A-Z]{1,4}(?:\.[0-9]{1,4})+)\b')
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 client      = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
-data_dir    = Path(__file__).parent / "data"
-CHUNKS_FILE = Path(__file__).with_name("chunks.json")
-EMBEDS_FILE = Path(__file__).with_name("embeddings.npy")
-FAISS_FILE  = Path(__file__).with_name("ffu.index")
+
+_persist       = Path(os.environ.get("DATA_DIR", Path(__file__).parent))
+data_dir       = _persist / "data"
+CHUNKS_FILE    = _persist / "chunks.json"
+EMBEDS_FILE    = _persist / "embeddings.npy"
+FAISS_FILE     = _persist / "ffu.index"
+DOC_TYPES_FILE = _persist / "doc_types.json"
+
+TOP_K_ADDENDUM = 8  # expanded K when addendum chunks are present
+
+ADDENDUM_PROMPT = """
+Some retrieved sections include both original document content and amendments.
+Where both versions exist, clearly present:
+- What the original document states
+- What the amendment changes it to
+Always make clear that the amendment supersedes the original."""
+
+CLASSIFY_PROMPT = """\
+Classify this construction document as either 'base' or 'addendum'.
+An addendum modifies, corrects, or supplements an existing base document \
+(also called amendment, tillägg, komplettering, ändring, KFU, rättelse).
+Reply with exactly one word: base or addendum."""
+
+async def classify_doc_type(filename: str, path: Path) -> str:
+    snippet = ""
+    try:
+        if filename.endswith(".pdf"):
+            doc = fitz.open(str(path))
+            for page in doc[:3]:
+                snippet += page.get_text()
+                if len(snippet) >= 1000:
+                    break
+            doc.close()
+        snippet = snippet[:1000].strip()
+    except Exception:
+        pass
+    if not snippet:
+        return "base"
+    try:
+        resp = await client.chat.completions.create(
+            model=FAST_MODEL, temperature=0, max_tokens=5,
+            messages=[
+                {"role": "system", "content": CLASSIFY_PROMPT},
+                {"role": "user",   "content": f"Filename: {filename}\n\n{snippet}"},
+            ],
+        )
+        return "addendum" if "addendum" in resp.choices[0].message.content.lower() else "base"
+    except Exception:
+        return "base"
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -205,24 +253,37 @@ async def lifespan(app):
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+api = APIRouter(prefix="/api")
 
 # ── /upload ────────────────────────────────────────────────────────────────────
 
-@app.post("/upload")
-async def upload(files: list[UploadFile] = File(...)):
+@api.post("/upload")
+async def upload(files: list[UploadFile] = File(...), overrides: str = Form("{}")):
     data_dir.mkdir(exist_ok=True)
-    saved = []
+    manual   = json.loads(overrides)
+    type_map = json.loads(DOC_TYPES_FILE.read_text()) if DOC_TYPES_FILE.exists() else {}
+    saved    = []
     for file in files:
         if not file.filename:
             continue
         (data_dir / file.filename).write_bytes(await file.read())
         saved.append(file.filename)
+
+    async def resolve_type(filename):
+        if filename in manual:
+            return filename, manual[filename]
+        return filename, await classify_doc_type(filename, data_dir / filename)
+
+    for filename, doc_type in await asyncio.gather(*[resolve_type(f) for f in saved]):
+        type_map[filename] = doc_type
+
+    DOC_TYPES_FILE.write_text(json.dumps(type_map, ensure_ascii=False, indent=2))
     logger.info(f"Uploaded: {saved}")
-    return {"saved": saved, "count": len(saved)}
+    return {"saved": saved, "count": len(saved), "doc_types": {f: type_map[f] for f in saved}}
 
 # ── /process ───────────────────────────────────────────────────────────────────
 
-@app.post("/process")
+@api.post("/process")
 async def process():
     pdf_paths  = sorted(data_dir.rglob("*.pdf"))
     xlsx_paths = sorted(data_dir.rglob("*.xlsx"))
@@ -253,11 +314,18 @@ async def process():
             except Exception as e:
                 logger.warning(f"Failed to parse {futures[fut].name}: {e}")
 
+    type_map   = json.loads(DOC_TYPES_FILE.read_text()) if DOC_TYPES_FILE.exists() else {}
     new_chunks = []
     for doc_name, text in raw_docs:
-        new_chunks.extend(chunk_document(doc_name, text))
+        chunks = chunk_document(doc_name, text)
+        for c in chunks:
+            c["metadata"]["doc_type"] = type_map.get(doc_name, "base")
+        new_chunks.extend(chunks)
     for path in new_xlsx:
-        new_chunks.extend(xlsx_to_chunks(path))
+        chunks = xlsx_to_chunks(path)
+        for c in chunks:
+            c["metadata"]["doc_type"] = type_map.get(path.name, "base")
+        new_chunks.extend(chunks)
 
     if not new_chunks:
         return {"status": "up_to_date", "chunks": len(existing_chunks), "new": 0}
@@ -284,7 +352,7 @@ async def process():
 
 # ── /debug ─────────────────────────────────────────────────────────────────────
 
-@app.post("/debug")
+@api.post("/debug")
 async def debug(body: dict):
     query      = body.get("message", "").strip()
     q_vec      = (await embed_texts([query]))[0]
@@ -303,10 +371,11 @@ Answer based ONLY on the document excerpts provided below.
 For every claim, cite its source as [Doc: <filename>, Section: <code or heading>].
 If the answer cannot be found in the excerpts, respond exactly:
 "Information not found in the provided documents."
-Do not infer or guess beyond what is explicitly stated.\
+Do not infer or guess beyond what is explicitly stated.
+Always answer in the same language as the question.\
 """
 
-@app.post("/chat")
+@api.post("/chat")
 async def chat(body: dict):
     query   = body.get("message", "").strip()
     history = body.get("history", [])
@@ -336,22 +405,42 @@ async def chat(body: dict):
     q_vec    = (await embed_texts([retrieval_query]))[0]
     embed_ms = int((time.monotonic() - t0) * 1000)
 
-    t0           = time.monotonic()
-    merged_ids   = rrf_merge([[i for i, _ in vector_search(q_vec, TOP_K_FETCH)],
-                               [i for i, _ in bm25_search(retrieval_query, TOP_K_FETCH)]])[:TOP_K_FINAL]
-    candidates   = [_chunk_index[i] for i in merged_ids if i < len(_chunk_index)]
+    t0         = time.monotonic()
+    all_ids    = rrf_merge([[i for i, _ in vector_search(q_vec, TOP_K_FETCH)],
+                             [i for i, _ in bm25_search(retrieval_query, TOP_K_FETCH)]])
+    candidates = [_chunk_index[i] for i in all_ids[:TOP_K_FINAL] if i < len(_chunk_index)]
+
+    # If any addendum chunk is present, expand K to surface both versions
+    has_addendum = any(c["metadata"].get("doc_type") == "addendum" for c in candidates)
+    if has_addendum:
+        candidates = [_chunk_index[i] for i in all_ids[:TOP_K_ADDENDUM] if i < len(_chunk_index)]
     retrieval_ms = int((time.monotonic() - t0) * 1000)
 
     final_chunks           = reorder_chunks(candidates)
     context_parts, sources = [], []
     for chunk in final_chunks:
-        meta    = chunk["metadata"]
-        section = meta.get("ama_code") or meta.get("section") or chunk["doc_name"]
-        context_parts.append(f"[Doc: {chunk['doc_name']}, Section: {section}]\n{chunk['text']}")
-        sources.append({"doc": chunk["doc_name"], "section": section})
+        meta     = chunk["metadata"]
+        section  = meta.get("ama_code") or meta.get("section") or chunk["doc_name"]
+        if not meta.get("ama_code") and section.upper() in ("INNEHÅLLSFÖRTECKNING", ""):
+            m = AMA_IN_TEXT.search(chunk["text"])
+            if m:
+                section = m.group(1)
+        doc_type = meta.get("doc_type", "base")
+        label    = "AMENDMENT" if doc_type == "addendum" else "Doc"
+        context_parts.append(f"[{label}: {chunk['doc_name']}, Section: {section}]\n{chunk['text']}")
+        sources.append({"doc": chunk["doc_name"], "section": section, "doc_type": doc_type})
 
+    seen, unique_sources = set(), []
+    for s in sources:
+        key = (s["doc"], s["section"])
+        if key not in seen:
+            seen.add(key)
+            unique_sources.append(s)
+    sources = unique_sources
+
+    system_content = SYSTEM_PROMPT + (ADDENDUM_PROMPT if has_addendum else "")
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_content},
         *history[-10:],
         {"role": "user", "content": "Context:\n\n" + "\n\n---\n\n".join(context_parts) + f"\n\nQuestion: {query}"},
     ]
@@ -384,7 +473,7 @@ async def chat(body: dict):
 
 # ── /stats ─────────────────────────────────────────────────────────────────────
 
-@app.get("/stats")
+@api.get("/stats")
 async def stats():
     if not _request_log:
         return {"total_requests": 0}
@@ -395,3 +484,9 @@ async def stats():
         "not_found_rate": round(sum(r["not_found"] for r in logs) / len(logs), 3),
         "recent":         logs[-10:][::-1],
     }
+
+app.include_router(api)
+
+_static = Path(__file__).parent / "static"
+if _static.exists():
+    app.mount("/", StaticFiles(directory=str(_static), html=True), name="static")
