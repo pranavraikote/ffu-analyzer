@@ -2,15 +2,11 @@
 
 > AI-powered decision support for Swedish construction tender documents.
 
-A wrong deadline missed. A requirement overlooked. An amendment that supersedes the original — read after the bid is submitted.
-
-These are real, costly mistakes in construction procurement. FFU Analyzer is built to prevent them.
-
----
+A wrong deadline missed. A requirement overlooked. An amendment that supersedes the original, i.e. read after the bid is submitted. These are real, costly mistakes in construction procurement. FFU Analyzer is built to prevent them.
 
 ## What It Does
 
-Upload your FFU package — base documents, addenda, Excel schedules — and ask questions in plain language. The system finds the relevant sections, understands which documents supersede which, and returns a cited answer you can verify.
+Upload your FFU package with base documents, addenda, Excel schedules, and ask questions in plain language. The system finds the relevant sections, understands which documents supersede which, and returns a cited answer you can verify.
 
 ```
 "What are the insurance requirements under AFC.5?"
@@ -18,7 +14,7 @@ Upload your FFU package — base documents, addenda, Excel schedules — and ask
 "What does the latest amendment change about the handover date?"
 ```
 
-Every answer cites its source document and section. If the information isn't in the documents, the system says so — it never guesses.
+Every answer cites its source document and section. If the information isn't in the documents, the system says so; it never guesses.
 
 ---
 
@@ -26,11 +22,11 @@ Every answer cites its source document and section. If the information isn't in 
 
 Standard RAG fails on documents like these. FFU packages are 100–1000+ pages, written in Swedish, structured around AMA codes, and issued with mid-bid amendments that invalidate earlier sections. Three concrete problems:
 
-**Wrong chunks retrieved** — a user query in plain Swedish misses exact terminology buried in the document. Fixed with hybrid search: BM25 catches exact Swedish terms and AMA codes (e.g. `AFC.171`), vector search handles semantic similarity. Results are merged with Reciprocal Rank Fusion.
+1. **Wrong chunks retrieved:** a user query in plain Swedish misses exact terminology buried in the document. **Fixed** with hybrid search: BM25 catches exact Swedish terms and AMA codes (e.g. `AFC.171`), vector search handles semantic similarity. Results are merged with Reciprocal Rank Fusion (RRF).
 
-**Right chunks, wrong answer** — LLMs degrade on information buried in the middle of long contexts. Fixed with lost-in-the-middle reordering: the most relevant chunks are placed first and last, not in the middle.
+2. **Right chunks, wrong answer:** LLMs degrade on information buried in the middle of long contexts. **Fixed** with lost-in-the-middle reordering: the most relevant chunks are placed first and last, not in the middle.
 
-**Amendment blindness** — if both a base document and an amendment are retrieved, a naive system picks arbitrarily. Fixed with amendment awareness: the system auto-detects which documents are amendments, expands retrieval to surface both versions, labels them explicitly in context, and instructs the LLM which supersedes.
+3. **Amendment blindness:** if both a base document and an amendment are retrieved, a naive system picks arbitrarily. **Fixed** with amendment awareness: the system auto-detects which documents are amendments, expands retrieval to surface both versions, labels them explicitly in context, and instructs the LLM which supersedes.
 
 ---
 
@@ -111,4 +107,4 @@ curl -X POST http://localhost:8000/api/debug -H "Content-Type: application/json"
   -d '{"message": "AFC.171"}'
 ```
 
-Returns the raw chunks that would be retrieved for a given query — useful for diagnosing retrieval misses.
+Returns the raw chunks that would be retrieved for a given query, useful for diagnosing retrieval misses.
