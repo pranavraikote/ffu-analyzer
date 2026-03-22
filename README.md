@@ -108,3 +108,18 @@ curl -X POST http://localhost:8000/api/debug -H "Content-Type: application/json"
 ```
 
 Returns the raw chunks that would be retrieved for a given query, useful for diagnosing retrieval misses.
+
+---
+
+## Reflection
+
+**Why I chose to build it**
+
+Construction procurement is a domain where a missed requirement or misread amendment has direct financial consequences. A generic RAG system fails here in predictable ways: vocabulary mismatch on Swedish terminology, LLM attention degrading on long contexts, amendments silently overriding base documents. The interesting problem was fixing each failure mode systematically, building something defensible rather than a demo that works on clean inputs.
+
+**What I would do next**
+
+- **Proactive requirement extraction:** on upload, automatically surface deadlines, submission requirements, and penalty clauses as a structured checklist. The biggest risk in procurement isn't a wrong answer — it's a requirement nobody thought to ask about.
+- **Context optimization:** hierarchical parent-child chunking: embed small chunks for precise retrieval, return the larger parent section to the LLM, with a token budget replacing the current fixed `TOP_K` slice.
+- **Multi-modal support:** enable table extraction (currently disabled) so prices, quantities, and penalty amounts in FFU tables are indexed and retrievable.
+- **Multi-tenancy:** move from a single shared index to per-project isolation, with Pinecone or pgvector replacing FAISS for scalable concurrent access.
